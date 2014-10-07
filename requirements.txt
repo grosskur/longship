@@ -1,0 +1,6 @@
+botocore==0.63.0
+jmespath==0.4.1
+python-dateutil==2.2
+simplejson==3.6.4
+six==1.8.0
+wsgiref==0.1.2

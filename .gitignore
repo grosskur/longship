@@ -1,0 +1,3 @@
+.envdir
+.venv
+*.pyc

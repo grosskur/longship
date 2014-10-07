@@ -1,0 +1,11 @@
+#!/usr/bin/env python2.7
+import sys
+
+import longship.app
+
+
+if __name__ == '__main__':
+    try:
+        longship.app.main(sys.argv[1:])
+    except KeyboardInterrupt:
+        print >> sys.stderr, 'interrupted'
