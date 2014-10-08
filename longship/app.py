@@ -26,7 +26,7 @@ _CONFIG_FILE = '.longship.json'
 
 class ArgumentParser(argparse.ArgumentParser):
     def error(self, message):
-        self.exit(2, '%s: error: %s\n' % (self.prog, message))
+        self.exit(2, '%s: error: %s\n' % (_PROG, message))
 
 
 class Error(Exception):
@@ -94,7 +94,7 @@ def _make_parser(app_config):
         help='show info about an app',
     )
     p_app_info.set_defaults(cmd='info')
-    p_app_info.add_argument('--app-name', default=app_name,
+    p_app_info.add_argument('--app', dest='app_name', default=app_name,
                             required=app_name is None)
 
     p_push = subparsers.add_parser(
@@ -102,7 +102,7 @@ def _make_parser(app_config):
         help='push a new version of an app',
     )
     p_push.set_defaults(cmd='push')
-    p_push.add_argument('--app-name', default=app_name,
+    p_push.add_argument('--app', dest='app_name', default=app_name,
                         required=app_name is None)
     p_push.add_argument('--packer-root', default=packer_root,
                         required=packer_root is None)
@@ -112,7 +112,7 @@ def _make_parser(app_config):
         help='upload a new Docker image for an app',
     )
     p_upload.set_defaults(cmd='upload')
-    p_upload.add_argument('--app-name', default=app_name,
+    p_upload.add_argument('--app', dest='app_name', default=app_name,
                           required=app_name is None)
 
     p_build = subparsers.add_parser(
@@ -120,7 +120,7 @@ def _make_parser(app_config):
         help='build a new AMI for an app',
     )
     p_build.set_defaults(cmd='build')
-    p_build.add_argument('--app-name', default=app_name,
+    p_build.add_argument('--app', dest='app_name', default=app_name,
                          required=app_name is None)
     p_build.add_argument('--packer-root', default=packer_root,
                          required=packer_root is None)
@@ -130,7 +130,7 @@ def _make_parser(app_config):
         help='deploy a new AMI for an app',
     )
     p_deploy.set_defaults(cmd='deploy')
-    p_deploy.add_argument('--app-name', default=app_name,
+    p_deploy.add_argument('--app', dest='app_name', default=app_name,
                           required=app_name is None)
 
     p_config = subparsers.add_parser(
@@ -138,15 +138,26 @@ def _make_parser(app_config):
         help='show environment variables for an app',
     )
     p_config.set_defaults(cmd='config')
-    p_config.add_argument('--app-name', default=app_name,
+    p_config.add_argument('--app', dest='app_name', default=app_name,
                           required=app_name is None)
+
+    p_set = subparsers.add_parser(
+        'set',
+        help='set environment variables for an app',
+    )
+    p_set.set_defaults(cmd='set')
+    p_set.add_argument('--app', dest='app_name', default=app_name,
+                       required=app_name is None)
+    # XXX: Use custom action
+    p_set.add_argument('config_var_map', metavar='KEY=VALUE', nargs='+',
+                       help='environment variable names and values')
 
     p_cleanup = subparsers.add_parser(
         'cleanup',
         help='clean up old resources for an app',
     )
     p_cleanup.set_defaults(cmd='cleanup')
-    p_cleanup.add_argument('--app-name', default=app_name,
+    p_cleanup.add_argument('--app', dest='app_name', default=app_name,
                            required=app_name is None)
 
     return parser
@@ -155,20 +166,22 @@ def _make_parser(app_config):
 def _run_cmd(parser, opts):
     if opts.cmd == 'apps':
         _cmd_app_list()
-    elif opts.cmd == 'info':
-        _cmd_app_info(opts.app_name)
-    elif opts.cmd == 'config':
-        _cmd_app_config(opts.app_name)
-    elif opts.cmd == 'push':
-        _cmd_push(opts.app_name, opts.packer_root)
     elif opts.cmd == 'build':
         _cmd_build(opts.app_name, opts.packer_root)
-    elif opts.cmd == 'deploy':
-        _cmd_deploy(opts.app_name)
-    elif opts.cmd == 'upload':
-        _cmd_upload(opts.app_name)
     elif opts.cmd == 'cleanup':
         _cmd_cleanup(opts.app_name)
+    elif opts.cmd == 'config':
+        _cmd_config_list(opts.app_name)
+    elif opts.cmd == 'deploy':
+        _cmd_deploy(opts.app_name)
+    elif opts.cmd == 'info':
+        _cmd_app_info(opts.app_name)
+    elif opts.cmd == 'push':
+        _cmd_push(opts.app_name, opts.packer_root)
+    elif opts.cmd == 'set':
+        _cmd_config_set(opts.app_name, opts.config_var_map)
+    elif opts.cmd == 'upload':
+        _cmd_upload(opts.app_name)
 
 
 def _cmd_app_list():
@@ -191,22 +204,42 @@ def _cmd_app_list():
         )
 
 
-def _cmd_app_config(app_name):
+def _cmd_config_list(app_name):
     resp, data = _call(
-        'dynamodb', 'Query',
+        'dynamodb', 'GetItem',
         table_name=_APP_TABLE,
-        key_conditions={
-            'app_name': {
-                'AttributeValueList': [{'S': app_name}],
-                'ComparisonOperator': 'EQ',
-            },
-        },
-        limit=1,
-        scan_index_forward=False,
+        key={'app_name': {'S': app_name}},
     )
-    env = simplejson.loads(data['Items'][0]['config_vars']['S'])
+    env = simplejson.loads(data['Item']['config_vars']['S'])
     for k, v in sorted(env.items()):
         print '{}={}'.format(k, v)
+
+
+def _cmd_config_set(app_name, config_var_map):
+    resp, data = _call(
+        'dynamodb', 'GetItem',
+        table_name=_APP_TABLE,
+        key={'app_name': {'S': app_name}},
+    )
+    env = simplejson.loads(data['Item']['config_vars']['S'])
+    m = {}
+    for x in config_var_map:
+        if '=' not in x:
+            raise Error('must include = sign: {}'.format(x))
+        k, v = x.split('=', 1)
+        m[k] = v
+    env.update(m)
+    resp, data = _call(
+        'dynamodb', 'UpdateItem',
+        table_name=_APP_TABLE,
+        key={'app_name': {'S': app_name}},
+        attribute_updates={
+            'config_vars': {
+                'Value': {'S': simplejson.dumps(env)},
+                'Action': 'PUT',
+            },
+        },
+    )
 
 
 def _cmd_app_info(app_name):
