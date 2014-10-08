@@ -1,5 +1,5 @@
 """
-Deployments for immutable infrasturcture on AWS
+Deployments for immutable infrastructure on AWS
 """
 import argparse
 import base64
@@ -47,6 +47,7 @@ def main(args):
 
 
 def _get_app_config():
+    # XXX: Search directory hierarchy for config file
     if not os.path.exists(_CONFIG_FILE):
         return {}
     with open(_CONFIG_FILE) as f:
@@ -80,7 +81,39 @@ def _make_parser(app_config):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(help='commands')
+    subparsers = parser.add_subparsers()
+
+    p_app_list = subparsers.add_parser(
+        'apps',
+        help='show list of apps',
+    )
+    p_app_list.set_defaults(cmd='apps')
+
+    p_app_info = subparsers.add_parser(
+        'info',
+        help='show info about an app',
+    )
+    p_app_info.set_defaults(cmd='info')
+    p_app_info.add_argument('--app-name', default=app_name,
+                            required=app_name is None)
+
+    p_push = subparsers.add_parser(
+        'push',
+        help='push a new version of an app',
+    )
+    p_push.set_defaults(cmd='push')
+    p_push.add_argument('--app-name', default=app_name,
+                        required=app_name is None)
+    p_push.add_argument('--packer-root', default=packer_root,
+                        required=packer_root is None)
+
+    p_upload = subparsers.add_parser(
+        'upload',
+        help='upload a new Docker image for an app',
+    )
+    p_upload.set_defaults(cmd='upload')
+    p_upload.add_argument('--app-name', default=app_name,
+                          required=app_name is None)
 
     p_build = subparsers.add_parser(
         'build',
@@ -100,24 +133,104 @@ def _make_parser(app_config):
     p_deploy.add_argument('--app-name', default=app_name,
                           required=app_name is None)
 
-    p_upload = subparsers.add_parser(
-        'upload',
-        help='upload a new Docker image for an app',
+    p_config = subparsers.add_parser(
+        'config',
+        help='show environment variables for an app',
     )
-    p_upload.set_defaults(cmd='upload')
-    p_upload.add_argument('--app-name', default=app_name,
+    p_config.set_defaults(cmd='config')
+    p_config.add_argument('--app-name', default=app_name,
                           required=app_name is None)
+
+    p_cleanup = subparsers.add_parser(
+        'cleanup',
+        help='clean up old resources for an app',
+    )
+    p_cleanup.set_defaults(cmd='cleanup')
+    p_cleanup.add_argument('--app-name', default=app_name,
+                           required=app_name is None)
 
     return parser
 
 
 def _run_cmd(parser, opts):
-    if opts.cmd == 'build':
+    if opts.cmd == 'apps':
+        _cmd_app_list()
+    elif opts.cmd == 'info':
+        _cmd_app_info(opts.app_name)
+    elif opts.cmd == 'config':
+        _cmd_app_config(opts.app_name)
+    elif opts.cmd == 'push':
+        _cmd_push(opts.app_name, opts.packer_root)
+    elif opts.cmd == 'build':
         _cmd_build(opts.app_name, opts.packer_root)
     elif opts.cmd == 'deploy':
         _cmd_deploy(opts.app_name)
     elif opts.cmd == 'upload':
         _cmd_upload(opts.app_name)
+    elif opts.cmd == 'cleanup':
+        _cmd_cleanup(opts.app_name)
+
+
+def _cmd_app_list():
+    resp, data = _call(
+        'dynamodb', 'Scan',
+        table_name=_APP_TABLE,
+        limit=20,
+    )
+    print '{:<20}  {:<10}  {:<15}  {:<15}  {:<15}  {:<5}'.format(
+        'APP', 'ENV', 'APP_IMAGE_ID', 'AMI_IMAGE_ID', 'INSTANCE_TYPE', 'CHECK',
+    )
+    for i in data['Items']:
+        print '{:<20}  {:<10}  {:<15}  {:<15}  {:<15}  {:<5}'.format(
+            i['app_name']['S'],
+            i['env_name']['S'],
+            i['app_image_id']['S'],
+            i['ami_image_id']['S'],
+            i['instance_type']['S'],
+            i['health_check_type']['S'],
+        )
+
+
+def _cmd_app_config(app_name):
+    resp, data = _call(
+        'dynamodb', 'Query',
+        table_name=_APP_TABLE,
+        key_conditions={
+            'app_name': {
+                'AttributeValueList': [{'S': app_name}],
+                'ComparisonOperator': 'EQ',
+            },
+        },
+        limit=1,
+        scan_index_forward=False,
+    )
+    env = simplejson.loads(data['Items'][0]['config_vars']['S'])
+    for k, v in sorted(env.items()):
+        print '{}={}'.format(k, v)
+
+
+def _cmd_app_info(app_name):
+    resp, data = _call(
+        'dynamodb', 'Query',
+        table_name=_APP_TABLE,
+        key_conditions={
+            'app_name': {
+                'AttributeValueList': [{'S': app_name}],
+                'ComparisonOperator': 'EQ',
+            },
+        },
+        limit=1,
+    )
+    for k, v in sorted(data['Items'][0].items()):
+        if k in ['config_vars', 'process_types']:
+            continue
+        print '{:<20} {}'.format(k + ':', v.values()[0])
+
+
+def _cmd_push(app_name, packer_root):
+    _cmd_upload(app_name)
+    _cmd_build(app_name, packer_root)
+    _cmd_deploy(app_name)
 
 
 def _cmd_build(app_name, packer_root):
@@ -180,7 +293,7 @@ def _cmd_build(app_name, packer_root):
         table_name='longship_app',
         key={'app_name': {'S': app['app_name']}},
         attribute_updates={
-            'amz_image_id': {
+            'ami_image_id': {
                 'Value': {'S': data['Images'][0]['ImageId']},
                 'Action': 'PUT',
             },
@@ -193,7 +306,12 @@ def _cmd_deploy(app_name):
     app = _get_app(app_name)
     instance_profile = _get_instance_profile(app)
     security_groups = _get_security_groups(app)
-    # queue_arn = _get_sqs_arn('prod-lifecycle-action')
+
+    for h in app['lifecycle_hooks']:
+        h['role_arn'] = _get_role_arn(h['role_name'])
+        if h['target_type'] != 'sqs':
+            raise Error('lifeycle hook target type must be "sqs"')
+        h['target_arn'] = _get_sqs_arn(h['target_name'])
 
     # XXX: get deployment lock
     asg_old = _get_old_asg(app)
@@ -208,7 +326,97 @@ def _cmd_deploy(app_name):
 
 
 def _cmd_upload(app_name):
-    pass
+    tag = '{}:{}'.format(app_name, 'build')
+
+    cmd = ['docker', 'build', '-t', tag, '.']
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError, exc:
+        raise Error(str(exc))
+
+    cmd = ['docker', 'inspect', tag]
+    try:
+        output = subprocess.check_output(cmd)
+    except subprocess.CalledProcessError, exc:
+        raise Error(str(exc))
+    data = simplejson.loads(output)
+
+    app_image_id = data[0]['Id'][:12]
+    app_image_tar = '{}.tpxz'.format(app_image_id)
+
+    app = _get_app(app_name)
+    if app['app_image_id'] == app_image_id:
+        logging.debug('Docker image already uploaded: %s', app_image_id)
+        return
+
+    logging.debug('uploading: {} -> s3://{}/{}'.format(
+        app_image_id, app['image_bucket'], app_image_tar,
+    ))
+    p1 = subprocess.Popen(['docker', 'save', app_image_id],
+                          stdout=subprocess.PIPE)
+    p2 = subprocess.Popen(['pixz'], stdin=p1.stdout, stdout=subprocess.PIPE)
+    p1.stdout.close()
+    p3 = subprocess.Popen(['gof3r', 'put', '-b', app['image_bucket'],
+                           '-k', app_image_tar], stdin=p2.stdout)
+    p2.stdout.close()
+    p3.communicate()
+
+    logging.debug('updating Docker image ID: %s', app_image_id)
+    resp, data = _call(
+        'dynamodb', 'UpdateItem',
+        table_name=_APP_TABLE,
+        key={'app_name': {'S': app_name}},
+        attribute_updates={
+            'app_image_id': {
+                'Value': {'S': app_image_id},
+                'Action': 'PUT',
+            },
+        },
+    )
+
+
+def _cmd_cleanup(app_name):
+    app = _get_app(app_name)
+    # XXX: clean up ASGs
+    # XXX: clean up LCs
+    resp, data = _call(
+        'ec2', 'DescribeImages',
+        filters=[
+            {'Name': 'tag:env', 'Values': [app['env_name']]},
+            {'Name': 'tag:app_name', 'Values': [app_name]},
+        ],
+    )
+    for i in sorted(data['Images'], key=lambda x: x['Name']):
+        # XXX: Check for active launch configuration
+        if i['Name'] == 'prod-cb-app-1412702790':
+            continue
+        logging.debug('cleaning up AMI: %s (%s)', i['Name'], i['ImageId'])
+        for m in i['BlockDeviceMappings']:
+            if m['DeviceName'] != '/dev/sda1':
+                continue
+            if 'Ebs' not in m:
+                continue
+            if 'SnapshotId' not in m['Ebs']:
+                continue
+
+            resp, data = _call(
+                'ec2', 'DescribeSnapshots',
+                snapshot_ids=[m['Ebs']['SnapshotId']],
+            )
+            volume = data['Snapshots'][0]
+
+            logging.debug('deleing volume: %s (%sG)',
+                          volume['VolumeId'], volume['VolumeSize'])
+            resp, data = _call('ec2', 'DeleteVolume',
+                               volume_id=volume['VolumeId'])
+
+            logging.debug('deleting snapshot: %s',
+                          m['Ebs']['SnapshotId'])
+            resp, data = _call('ec2', 'DeleteSnapshot',
+                               snapshot_id=m['Ebs']['SnapshotId'])
+
+        logging.debug('deregistering AMI: %s', i['ImageId'])
+        resp, data = _call('ec2', 'DeregisterImage', image_id=i['ImageId'])
 
 
 def _get_old_asg(app):
@@ -260,16 +468,16 @@ def _get_security_groups(app):
 
 def _create_launch_config(app, timestamp, instance_profile, security_groups):
     lc_name = '{}-{}-{}'.format(app['env_name'], app['app_name'], timestamp)
-    logging.debug('creating LC: %s (%s)', lc_name, app['amz_image_id'])
+    logging.debug('creating LC: %s (%s)', lc_name, app['ami_image_id'])
     kwargs = {
         'launch_configuration_name': lc_name,
-        'image_id': app['amz_image_id'],
+        'image_id': app['ami_image_id'],
         'key_name': app['key_name'],
         'security_groups': security_groups,
         'instance_type': app['instance_type'],
         'iam_instance_profile': instance_profile,
     }
-    if app.get('user_data') is not None:
+    if app['user_data']:
         kwargs['user_data'] = app['user_data']
     resp, data = _call('autoscaling', 'CreateLaunchConfiguration', **kwargs)
 
@@ -279,19 +487,16 @@ def _get_sqs_arn(queue_name):
         'sqs', 'GetQueueUrl',
         queue_name=queue_name,
     )
-    logging.debug('data=%s', data)
     resp, data = _call(
         'sqs', 'GetQueueAttributes',
         queue_url=data['QueueUrl'],
         attribute_names=['QueueArn'],
     )
-    logging.debug('data=%s', data)
     return data['Attributes']['QueueArn']
 
 
 def _get_role_arn(role_name):
     resp, data = _call('iam', 'GetRole', role_name=role_name)
-    logging.debug('data=%s', data)
     return data['Role']['Arn']
 
 
@@ -321,13 +526,17 @@ def _create_auto_scaling_group(app, timestamp, desired_capacity):
         }],
     }
     resp, data = _call('autoscaling', 'CreateAutoScalingGroup', **kwargs)
-
-    # resp, data = _call('autoscaling', 'PutLifecycleHook',
-    #                    auto_scaling_group_name=app_new,
-    #                    lifecycle_hook_name=app_new + '-shutdown',
-    #                    lifecycle_transition='autoscaling:EC2_INSTANCE_TERMINATING',
-    #                    notification_target_arn=_get_sqs_arn('prod-lifecycle-action'),
-    #                    role_arn=_get_role_arn('prod-lifecycle-action'))
+    for h in app['lifecycle_hooks']:
+        hook_name = '{}-{}'.format(asg_name, h['hook_name'])
+        logging.debug('creating ASG lifecycle hook: %s', hook_name)
+        resp, data = _call(
+            'autoscaling', 'PutLifecycleHook',
+            auto_scaling_group_name=asg_name,
+            lifecycle_hook_name=hook_name,
+            lifecycle_transition=h['hook_type'],
+            notification_target_arn=h['target_arn'],
+            role_arn=h['role_arn'],
+        )
 
 
 def _wait_for_running_instances(app, timestamp, desired_capacity):
@@ -386,6 +595,7 @@ def _shutdown_instances(asg_old):
         return
 
     logging.debug('putting old instances into standby')
+    # XXX: set min_size=0 first
     resp, data = _call(
         'autoscaling', 'EnterStandby',
         auto_scaling_group_name=asg_old['AutoScalingGroupName'],
@@ -490,7 +700,7 @@ def _get_app(app_name):
     env_data = data['Item']
 
     app = {
-        'amz_image_id': app_data['amz_image_id']['S'],
+        'ami_image_id': app_data['ami_image_id']['S'],
         'app_image_id': app_data['app_image_id']['S'],
         'app_name': app_data['app_name']['S'],
         'app_subnet_ids': simplejson.loads(env_data['app_subnet_ids']['S']),
@@ -512,7 +722,19 @@ def _get_app(app_name):
         'process_types': simplejson.loads(app_data['process_types']['S']),
         'vpc_id': env_data['vpc_id']['S'],
     }
-    # logging.debug('app=%s', app)
+
+    if 'lifecycle_hooks' in app_data:
+        app['lifecycle_hooks'] = simplejson.loads(
+            app_data['lifecycle_hooks']['S'],
+        )
+    else:
+        app['lifecycle_hooks'] = []
+
+    if 'user_data' in app_data:
+        app['user_data'] = base64.b64decode(app_data['user_data']['S'])
+    else:
+        app['user_data'] = ''
+
     return app
 
 
