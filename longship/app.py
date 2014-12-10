@@ -197,8 +197,8 @@ def _cmd_app_list():
         print '{:<20}  {:<10}  {:<15}  {:<15}  {:<15}  {:<5}'.format(
             i['app_name']['S'],
             i['env_name']['S'],
-            i['app_image_id']['S'],
-            i['ami_image_id']['S'],
+            i['app_image_id']['S'] if 'app_image_id' in i else '',
+            i['ami_image_id']['S'] if 'ami_image_id' in i else '',
             i['instance_type']['S'],
             i['health_check_type']['S'],
         )
@@ -348,14 +348,16 @@ def _cmd_deploy(app_name):
 
     # XXX: get deployment lock
     asg_old = _get_old_asg(app)
-    desired_capacity = asg_old['DesiredCapacity']
+    desired_capacity = asg_old['DesiredCapacity'] if asg_old is not None else 1
 
     _create_launch_config(app, timestamp, instance_profile, security_groups)
     _create_auto_scaling_group(app, timestamp, desired_capacity)
     _wait_for_running_instances(app, timestamp, desired_capacity)
-    _shutdown_instances(asg_old)
-    _delete_auto_scaling_group(asg_old)
-    _delete_launch_config(asg_old['LaunchConfigurationName'])
+
+    if asg_old:
+        _shutdown_instances(asg_old)
+        _delete_auto_scaling_group(asg_old)
+        _delete_launch_config(asg_old['LaunchConfigurationName'])
 
 
 def _cmd_upload(app_name):
@@ -455,6 +457,7 @@ def _cmd_cleanup(app_name):
 def _get_old_asg(app):
     elbs = _get_elbs(app)
     asgs = []
+    asg_old = None
     if elbs:
         logging.debug('verifying ELB: %s', elbs[0])
 
@@ -462,18 +465,23 @@ def _get_old_asg(app):
                            load_balancer_names=elbs)
         elb = data['LoadBalancerDescriptions'][0]
 
-        resp, data = _call('autoscaling', 'DescribeAutoScalingInstances',
-                           instance_ids=[i['InstanceId']
-                                         for i in elb['Instances']])
-        asgs = list(set(i['AutoScalingGroupName']
-                        for i in data['AutoScalingInstances']))
+        asgs = []
+        if elb['Instances']:
+            resp, data = _call('autoscaling', 'DescribeAutoScalingInstances',
+                               instance_ids=[i['InstanceId']
+                                             for i in elb['Instances']])
+            asgs = list(set(i['AutoScalingGroupName']
+                            for i in data['AutoScalingInstances']))
 
         if len(asgs) > 1:
             logging.critical('found %d ASGs for ELB %s', len(asgs), elbs[0])
 
-        resp, data = _call('autoscaling', 'DescribeAutoScalingGroups',
-                           auto_scaling_group_names=asgs)
-        asg_old = data['AutoScalingGroups'][0]
+        if asgs:
+            resp, data = _call('autoscaling', 'DescribeAutoScalingGroups',
+                               auto_scaling_group_names=asgs)
+            asg_old = data['AutoScalingGroups'][0]
+        else:
+            asg_old = None
     else:
         resp, data = _call('autoscaling', 'DescribeAutoScalingGroups')
         for g in data['AutoScalingGroups']:
@@ -733,8 +741,6 @@ def _get_app(app_name):
     env_data = data['Item']
 
     app = {
-        'ami_image_id': app_data['ami_image_id']['S'],
-        'app_image_id': app_data['app_image_id']['S'],
         'app_name': app_data['app_name']['S'],
         'app_subnet_ids': simplejson.loads(env_data['app_subnet_ids']['S']),
         'availability_zones': simplejson.loads(
@@ -755,6 +761,16 @@ def _get_app(app_name):
         'process_types': simplejson.loads(app_data['process_types']['S']),
         'vpc_id': env_data['vpc_id']['S'],
     }
+
+    if 'ami_image_id' in app_data:
+        app['ami_image_id'] = app_data['ami_image_id']['S']
+    else:
+        app['ami_image_id'] = ''
+
+    if 'app_image_id' in app_data:
+        app['app_image_id'] = app_data['app_image_id']['S']
+    else:
+        app['app_image_id'] = ''
 
     if 'lifecycle_hooks' in app_data:
         app['lifecycle_hooks'] = simplejson.loads(
