@@ -235,7 +235,8 @@ def _cmd_config_set(app_name, config_var_map):
         key={'app_name': {'S': app_name}},
         attribute_updates={
             'config_vars': {
-                'Value': {'S': simplejson.dumps(env)},
+                'Value': {'S': simplejson.dumps(env, sort_keys=True,
+                                                separators=(',', ':'))},
                 'Action': 'PUT',
             },
         },
@@ -278,10 +279,12 @@ def _cmd_build(app_name, packer_root):
     security_group_id = data['SecurityGroups'][0]['GroupId']
     config_vars = base64.b64encode(simplejson.dumps(
         app['config_vars'],
+        sort_keys=True,
         separators=(',', ':'),
     ))
     process_types = base64.b64encode(simplejson.dumps(
         app['process_types'],
+        sort_keys=True,
         separators=(',', ':'),
     ))
 
@@ -519,6 +522,7 @@ def _create_launch_config(app, timestamp, instance_profile, security_groups):
         'iam_instance_profile': instance_profile,
     }
     if app['user_data']:
+        logging.debug('user_data=%s', app['user_data'])
         kwargs['user_data'] = app['user_data']
     resp, data = _call('autoscaling', 'CreateLaunchConfiguration', **kwargs)
 
@@ -601,7 +605,7 @@ def _wait_for_running_instances(app, timestamp, desired_capacity):
 
             for i in asg['Instances']:
                 i['State'] = 'Invalid'
-                for j in data['InstanceStates']:
+                for j in data.get('InstanceStates', []):
                     if i['InstanceId'] == j['InstanceId']:
                         i['State'] = j['State']
 
@@ -721,8 +725,8 @@ def _call(service, operation, **kwargs):
     svc = session.get_service(service)
     op = svc.get_operation(operation)
     endpoint = svc.get_endpoint(_AWS_REGION)
-    #logging.debug('service=%s operation=%s', service, operation)
-    return op.call(endpoint, **kwargs)
+    resp, data = op.call(endpoint, **kwargs)
+    return resp, data
 
 
 def _get_app(app_name):
@@ -780,7 +784,7 @@ def _get_app(app_name):
         app['lifecycle_hooks'] = []
 
     if 'user_data' in app_data:
-        app['user_data'] = base64.b64decode(app_data['user_data']['S'])
+        app['user_data'] = app_data['user_data']['S']
     else:
         app['user_data'] = ''
 
