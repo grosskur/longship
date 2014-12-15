@@ -1,4 +1,4 @@
-botocore==0.78.0
+botocore==0.79.0
 jmespath==0.5.0
 python-dateutil==2.3
 simplejson==3.6.5
