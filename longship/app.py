@@ -6,15 +6,18 @@ import base64
 import calendar
 import logging
 import os
+import requests
 import subprocess
 import sys
 import time
+import urlparse
 
 import botocore.session
 import simplejson
 
 
-logging.getLogger('botocore').setLevel(logging.CRITICAL)
+logging.getLogger('botocore').setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
 
 
 _PROG = 'longship'
@@ -133,6 +136,16 @@ def _make_parser(app_config):
     p_deploy.add_argument('--app', dest='app_name', default=app_name,
                           required=app_name is None)
 
+    p_log = subparsers.add_parser(
+        'log',
+        help='display log for an app',
+    )
+    p_log.set_defaults(cmd='log')
+    p_log.add_argument('--app', dest='app_name', default=app_name,
+                       required=app_name is None)
+    p_log.add_argument('-n', '--num', dest='num')
+    p_log.add_argument('-t', '--tail', dest='tail', action='store_true')
+
     p_config = subparsers.add_parser(
         'config',
         help='show environment variables for an app',
@@ -174,6 +187,8 @@ def _run_cmd(parser, opts):
         _cmd_config_list(opts.app_name)
     elif opts.cmd == 'deploy':
         _cmd_deploy(opts.app_name)
+    elif opts.cmd == 'log':
+        _cmd_log(opts.app_name, opts.num, opts.tail)
     elif opts.cmd == 'info':
         _cmd_app_info(opts.app_name)
     elif opts.cmd == 'push':
@@ -300,7 +315,7 @@ def _cmd_build(app_name, packer_root):
         '-var', 'app_image_bucket={}'.format(app['image_bucket']),
         '-var', 'app_image_id={}'.format(app['app_image_id']),
         '-var', 'app_logplex_token={}'.format(app['logplex_token']),
-        '-var', 'app_logplex_url={}'.format(app['logplex_url']),
+        '-var', 'app_logplex_input_url={}'.format(app['logplex_input_url']),
         '-var', 'app_name={}'.format(app['app_name']),
         '-var', 'config_vars={}'.format(config_vars),
         '-var', 'process_types={}'.format(process_types),
@@ -361,6 +376,43 @@ def _cmd_deploy(app_name):
         _shutdown_instances(asg_old)
         _delete_auto_scaling_group(asg_old)
         _delete_launch_config(asg_old['LaunchConfigurationName'])
+
+
+def _cmd_log(app_name, num, tail):
+    app = _get_app(app_name)
+    if not app['logplex_channel_id']:
+        logging.error('logplex_channel_id not found')
+
+    url = urlparse.urljoin(app['logplex_url'], '/v2/sessions')
+    payload = {'channel_id': app['logplex_channel_id']}
+    if num:
+        payload['num'] = num
+    if tail:
+        payload['tail'] = True
+
+    s = requests.Session()
+    r = s.post(url, auth=(app['logplex_user'], app['logplex_password']),
+               data=simplejson.dumps(payload))
+    data = r.json()
+    url = urlparse.urljoin(app['logplex_url'], data['url'])
+    while True:
+        r = s.get(url, stream=True, params={'srv': '1'})
+        if r.status_code != 200:
+            logging.error('session does not exist: %s', data['url'])
+            break
+
+        while True:
+            # raw = urllib3 HTTPResponse
+            # raw._fp = httplib HTTPResponse
+            # raw._fp.fp = socket file-like object returned by socket.makefile()
+            # raw._fp.fp._sock is the actual socket where we could call recv()
+            line = r.raw._fp.fp.readline(8192)
+            if not line:
+                break
+            print line,
+
+        if not tail:
+            break
 
 
 def _cmd_upload(app_name):
@@ -495,9 +547,10 @@ def _get_old_asg(app):
 
 
 def _get_instance_profile(app):
-    instance_profile_name = '{}-{}'.format(app['env_name'], app['app_name'])
+    if not app['instance_profile_name']:
+        return None
     resp, data = _call('iam', 'GetInstanceProfile',
-                       instance_profile_name=instance_profile_name)
+                       instance_profile_name=app['instance_profile_name'])
     return data['InstanceProfile']['Arn']
 
 
@@ -519,8 +572,10 @@ def _create_launch_config(app, timestamp, instance_profile, security_groups):
         'key_name': app['key_name'],
         'security_groups': security_groups,
         'instance_type': app['instance_type'],
-        'iam_instance_profile': instance_profile,
     }
+    if app['instance_profile_name']:
+        logging.debug('iam_instance_profile=%s', instance_profile)
+        kwargs['iam_instance_profile'] = instance_profile
     if app['user_data']:
         logging.debug('user_data=%s', app['user_data'])
         kwargs['user_data'] = app['user_data']
@@ -581,6 +636,29 @@ def _create_auto_scaling_group(app, timestamp, desired_capacity):
             lifecycle_transition=h['hook_type'],
             notification_target_arn=h['target_arn'],
             role_arn=h['role_arn'],
+        )
+
+    for p in app['scaling_policies']:
+        logging.debug('creating ASG scaling policy: %s', p['policy_name'])
+        resp, data = _call(
+            'autoscaling', 'PutScalingPolicy',
+            auto_scaling_group_name=asg_name,
+            policy_name=p['policy_name'],
+            scaling_adjustment=p['scaling_adjustment'],
+            adjustment_type=p['adjustment_type'],
+        )
+        resp, data = _call(
+            'cloudwatch', 'PutMetricAlarm',
+            alarm_name=p['alarm']['alarm_name'],
+            comparison_operator=p['alarm']['comparison_operator'],
+            evaluation_periods=p['alarm']['evaluation_periods'],
+            metric_name=p['alarm']['metric_name'],
+            namespace=p['alarm']['namespace'],
+            period=p['alarm']['period'],
+            statistic=p['alarm']['statistic'],
+            threshold=p['alarm']['threshold'],
+            dimensions=p['alarm']['dimensions'],
+            alarm_actions=[data['PolicyARN']],
         )
 
 
@@ -725,7 +803,9 @@ def _call(service, operation, **kwargs):
     svc = session.get_service(service)
     op = svc.get_operation(operation)
     endpoint = svc.get_endpoint(_AWS_REGION)
+    # logging.debug('service=%s operation=%s', service, operation)
     resp, data = op.call(endpoint, **kwargs)
+    # logging.debug('resp=%s data=%s', resp, data)
     return resp, data
 
 
@@ -758,8 +838,6 @@ def _get_app(app_name):
         'image_bucket': env_data['image_bucket']['S'],
         'instance_type': app_data['instance_type']['S'],
         'key_name': env_data['key_name']['S'],
-        'logplex_token': app_data['logplex_token']['S'],
-        'logplex_url': env_data['logplex_url']['S'],
         'preferred_availability_zone': env_data[
             'preferred_availability_zone']['S'],
         'process_types': simplejson.loads(app_data['process_types']['S']),
@@ -776,12 +854,54 @@ def _get_app(app_name):
     else:
         app['app_image_id'] = ''
 
+    if 'instance_profile_name' in app_data:
+        app['instance_profile_name'] = app_data['instance_profile_name']['S']
+    else:
+        app['instance_profile_name'] = ''
+
     if 'lifecycle_hooks' in app_data:
         app['lifecycle_hooks'] = simplejson.loads(
             app_data['lifecycle_hooks']['S'],
         )
     else:
         app['lifecycle_hooks'] = []
+
+    if 'scaling_policies' in app_data:
+        app['scaling_policies'] = simplejson.loads(
+            app_data['scaling_policies']['S'],
+        )
+    else:
+        app['scaling_policies'] = []
+
+    if 'logplex_channel_id' in app_data:
+        app['logplex_channel_id'] = app_data['logplex_channel_id']['S']
+    else:
+        app['logplex_channel_id'] = ''
+
+    if 'logplex_token' in app_data:
+        app['logplex_token'] = app_data['logplex_token']['S']
+    else:
+        app['logplex_token'] = ''
+
+    if 'logplex_input_url' in env_data:
+        app['logplex_input_url'] = env_data['logplex_input_url']['S']
+    else:
+        app['logplex_input_url'] = ''
+
+    if 'logplex_url' in env_data:
+        app['logplex_url'] = env_data['logplex_url']['S']
+    else:
+        app['logplex_url'] = ''
+
+    if 'logplex_password' in env_data:
+        app['logplex_password'] = env_data['logplex_password']['S']
+    else:
+        app['logplex_password'] = ''
+
+    if 'logplex_user' in env_data:
+        app['logplex_user'] = env_data['logplex_user']['S']
+    else:
+        app['logplex_user'] = ''
 
     if 'user_data' in app_data:
         app['user_data'] = app_data['user_data']['S']
