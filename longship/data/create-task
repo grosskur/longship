@@ -1,0 +1,105 @@
+#!/usr/bin/python -B
+import json
+import logging
+import os
+import subprocess
+import sys
+
+
+_PROG = 'create-task'
+_DOCKER_LOGS_INIT_TEMPLATE = """\
+description "Docker logs {container_id}"
+
+start on started docker
+stop on stopping docker
+
+respawn
+respawn limit 15 5
+console output
+
+exec docker logs -f --tail=0 {container_id} 2>&1 | log-shuttle -procid={container_name}.$(ec2metadata --instance-id | sed 's/^i-//') -logplex-token={logplex_token} -logs-url={logplex_input_url}
+"""
+
+
+def _main(args):
+    _setup_logging()
+
+    cmd = ['ec2metadata', '--instance-id']
+    logging.info('running: %s', ' '.join(cmd))
+    instance_id = subprocess.check_output(cmd).strip()[2:]
+    logging.info('instance ID: %s', instance_id)
+
+    data = json.load(sys.stdin)
+    images = list(set([c['image'] for c in data]))
+    for i in images:
+        # gof3r get -b "$APP_IMAGE_BUCKET" -k "$APP_IMAGE_ID".tpxz | pixz -d | docker load
+        cmd1 = ['gof3r', 'get', '-b', os.getenv('APP_IMAGE_BUCKET'), '-k', '{}.tpxz'.format(i)]
+        cmd2 = ['pixz', '-d']
+        cmd3 = ['docker', 'load']
+
+        logging.info('running: %s | %s | %s', ' '.join(cmd1), ' '.join(cmd2), ' '.join(cmd3))
+        p1 = subprocess.Popen(cmd1, stdout=subprocess.PIPE)
+        p2 = subprocess.Popen(cmd2, stdin=p1.stdout, stdout=subprocess.PIPE)
+        p3 = subprocess.Popen(cmd3, stdin=p2.stdout, stdout=subprocess.PIPE)
+
+        p1.stdout.close()
+        p2.stdout.close()
+        p3.communicate()
+
+    for c in data:
+        cmd = ['docker', 'create', '--name={}'.format(c['name']), '--restart=always']
+        for e in c.get('environment', []):
+            cmd.append('--env={}={}'.format(e['name'], e['value']))
+        if c.get('entryPoint'):
+            cmd.append('--entrypoint={}'.format(c['entrypoint']))
+        for m in c.get('portMappings', []):
+            cmd.append('--publish={}:{}'.format(m['hostPort'],
+                                                m['containerPort']))
+        for x in c.get('links', []):
+            cmd.append('--link={}'.format(x))
+        if c.get('cpu'):
+            cmd.append('--cpu-shares={}'.format(c['cpu']))
+        if c.get('memory'):
+            cmd.append('--memory={}m'.format(c['memory']))
+        cmd.append(c['image'])
+        if c.get('command'):
+            cmd.extend(c['command'])
+        logging.info('running: %s', ' '.join(cmd))
+        container_id = subprocess.check_output(cmd).strip()
+        logging.info('container ID: %s', container_id)
+
+        logplex_token = os.getenv('APP_LOGPLEX_TOKEN')
+        logplex_input_url = os.getenv('APP_LOGPLEX_INPUT_URL')
+        if logplex_token and logplex_input_url:
+            init_file = '/etc/init/docker-logs-{}.conf'.format(container_id)
+            logging.info('creating upstart service: %s', init_file)
+            with open(init_file, 'w') as f:
+                f.write(_DOCKER_LOGS_INIT_TEMPLATE.format(**{
+                    'container_id': container_id,
+                    'container_name': c['name'],
+                    'instance_id': instance_id,
+                    'logplex_token': logplex_token,
+                    'logplex_input_url': logplex_input_url,
+                }))
+
+
+def _setup_logging():
+    fmt = _PROG + ': %(levelname)s: %(message)s'
+
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(fmt=fmt)
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger('')
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+
+    logging.addLevelName(logging.DEBUG, 'debug')
+    logging.addLevelName(logging.INFO, 'info')
+    logging.addLevelName(logging.WARNING, 'warning')
+    logging.addLevelName(logging.ERROR, 'error')
+    logging.addLevelName(logging.CRITICAL, 'critical')
+
+
+if __name__ == '__main__':
+    _main(sys.argv[1:])

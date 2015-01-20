@@ -7,8 +7,13 @@ import calendar
 import logging
 import os
 import requests
+import requests.exceptions
+import requests.packages.urllib3.exceptions
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urlparse
 
@@ -77,7 +82,7 @@ def _setup_logging():
 
 def _make_parser(app_config):
     app_name = app_config.get('app_name')
-    packer_root = app_config.get('packer_root')
+    image_tag = app_config.get('image_tag')
 
     parser = ArgumentParser(
         prog=_PROG,
@@ -107,8 +112,8 @@ def _make_parser(app_config):
     p_push.set_defaults(cmd='push')
     p_push.add_argument('--app', dest='app_name', default=app_name,
                         required=app_name is None)
-    p_push.add_argument('--packer-root', default=packer_root,
-                        required=packer_root is None)
+    p_push.add_argument('--image-tag', default=image_tag,
+                        required=image_tag is None)
 
     p_upload = subparsers.add_parser(
         'upload',
@@ -117,6 +122,8 @@ def _make_parser(app_config):
     p_upload.set_defaults(cmd='upload')
     p_upload.add_argument('--app', dest='app_name', default=app_name,
                           required=app_name is None)
+    p_upload.add_argument('--image-tag', default=image_tag,
+                         required=image_tag is None)
 
     p_build = subparsers.add_parser(
         'build',
@@ -125,8 +132,6 @@ def _make_parser(app_config):
     p_build.set_defaults(cmd='build')
     p_build.add_argument('--app', dest='app_name', default=app_name,
                          required=app_name is None)
-    p_build.add_argument('--packer-root', default=packer_root,
-                         required=packer_root is None)
 
     p_deploy = subparsers.add_parser(
         'deploy',
@@ -180,7 +185,7 @@ def _run_cmd(parser, opts):
     if opts.cmd == 'apps':
         _cmd_app_list()
     elif opts.cmd == 'build':
-        _cmd_build(opts.app_name, opts.packer_root)
+        _cmd_build(opts.app_name)
     elif opts.cmd == 'cleanup':
         _cmd_cleanup(opts.app_name)
     elif opts.cmd == 'config':
@@ -192,11 +197,11 @@ def _run_cmd(parser, opts):
     elif opts.cmd == 'info':
         _cmd_app_info(opts.app_name)
     elif opts.cmd == 'push':
-        _cmd_push(opts.app_name, opts.packer_root)
+        _cmd_push(opts.app_name, opts.image_tag)
     elif opts.cmd == 'set':
         _cmd_config_set(opts.app_name, opts.config_var_map)
     elif opts.cmd == 'upload':
-        _cmd_upload(opts.app_name)
+        _cmd_upload(opts.app_name, opts.image_tag)
 
 
 def _cmd_app_list():
@@ -205,17 +210,16 @@ def _cmd_app_list():
         table_name=_APP_TABLE,
         limit=20,
     )
-    print '{:<20}  {:<10}  {:<15}  {:<15}  {:<15}  {:<5}'.format(
-        'APP', 'ENV', 'APP_IMAGE_ID', 'AMI_IMAGE_ID', 'INSTANCE_TYPE', 'CHECK',
+    print '{:<20}  {:<10}  {:<15}  {:<15}  {:<15}'.format(
+        'APP', 'ENV', 'APP_IMAGE_ID', 'IMAGE_ID', 'INSTANCE_TYPE',
     )
     for i in data['Items']:
-        print '{:<20}  {:<10}  {:<15}  {:<15}  {:<15}  {:<5}'.format(
+        print '{:<20}  {:<10}  {:<15}  {:<15}  {:<15}'.format(
             i['app_name']['S'],
             i['env_name']['S'],
             i['app_image_id']['S'] if 'app_image_id' in i else '',
-            i['ami_image_id']['S'] if 'ami_image_id' in i else '',
+            i['image_id']['S'] if 'image_id' in i else '',
             i['instance_type']['S'],
-            i['health_check_type']['S'],
         )
 
 
@@ -271,18 +275,16 @@ def _cmd_app_info(app_name):
         limit=1,
     )
     for k, v in sorted(data['Items'][0].items()):
-        if k in ['config_vars', 'process_types']:
-            continue
         print '{:<20} {}'.format(k + ':', v.values()[0])
 
 
-def _cmd_push(app_name, packer_root):
-    _cmd_upload(app_name)
-    _cmd_build(app_name, packer_root)
+def _cmd_push(app_name, image_tag):
+    _cmd_upload(app_name, image_tag)
+    _cmd_build(app_name)
     _cmd_deploy(app_name)
 
 
-def _cmd_build(app_name, packer_root):
+def _cmd_build(app_name):
     timestamp = calendar.timegm(time.gmtime())
     app = _get_app(app_name)
     ami_name = '{}-{}-{}'.format(app['env_name'], app['app_name'], timestamp)
@@ -292,17 +294,6 @@ def _cmd_build(app_name, packer_root):
                   'Values': ['{}-{}'.format(app['env_name'], 'packer')]}],
     )
     security_group_id = data['SecurityGroups'][0]['GroupId']
-    config_vars = base64.b64encode(simplejson.dumps(
-        app['config_vars'],
-        sort_keys=True,
-        separators=(',', ':'),
-    ))
-    process_types = base64.b64encode(simplejson.dumps(
-        app['process_types'],
-        sort_keys=True,
-        separators=(',', ':'),
-    ))
-
     cmd = [
         'packer', 'build',
         '-color=false',
@@ -313,23 +304,38 @@ def _cmd_build(app_name, packer_root):
         '-var', 'subnet_id={}'.format(app['builder_subnet_id']),
         '-var', 'vpc_id={}'.format(app['vpc_id']),
         '-var', 'app_image_bucket={}'.format(app['image_bucket']),
-        '-var', 'app_image_id={}'.format(app['app_image_id']),
         '-var', 'app_logplex_token={}'.format(app['logplex_token']),
         '-var', 'app_logplex_input_url={}'.format(app['logplex_input_url']),
         '-var', 'app_name={}'.format(app['app_name']),
-        '-var', 'config_vars={}'.format(config_vars),
-        '-var', 'process_types={}'.format(process_types),
         '-var', 'timestamp={}'.format(timestamp),
-        os.path.join('packer.json'),
+        'packer.json',
     ]
+
     logging.debug('building AMI: %s', ami_name)
+    packer_root = None
     try:
+        packer_root = tempfile.mkdtemp()
+        td_fname = os.path.join(packer_root, 'task-definition.json')
+        data_dir = os.path.join(os.path.dirname(__file__), 'data')
+        for f in ('create-task', 'packer.json', 'provision'):
+            src = os.path.join(data_dir, f)
+            dst = os.path.join(packer_root, f)
+            logging.debug('copying: %s -> %s', src, dst)
+            shutil.copyfile(src, dst)
+        if app.get('task_definition'):
+            with open(td_fname, 'w') as f:
+                f.write(simplejson.dumps(app['task_definition'],
+                                         sort_keys=True, indent=2))
         p = subprocess.Popen(cmd, cwd=packer_root)
         p.communicate()
     except KeyboardInterrupt:
         p.terminate()
         p.wait()
         raise
+    finally:
+        if packer_root is not None and os.path.exists(packer_root):
+            logging.debug('deleting: %s', packer_root)
+            shutil.rmtree(packer_root)
 
     if p.returncode != 0:
         raise Error('packer exited with code {}'.format(p.returncode))
@@ -344,7 +350,7 @@ def _cmd_build(app_name, packer_root):
         table_name='longship_app',
         key={'app_name': {'S': app['app_name']}},
         attribute_updates={
-            'ami_image_id': {
+            'image_id': {
                 'Value': {'S': data['Images'][0]['ImageId']},
                 'Action': 'PUT',
             },
@@ -391,8 +397,14 @@ def _cmd_log(app_name, num, tail):
         payload['tail'] = True
 
     s = requests.Session()
-    r = s.post(url, auth=(app['logplex_user'], app['logplex_password']),
-               data=simplejson.dumps(payload))
+    try:
+        r = s.post(url, auth=(app['logplex_user'], app['logplex_password']),
+                   data=simplejson.dumps(payload))
+    except requests.exceptions.ConnectionError as exc:
+        if isinstance(exc.args[0], requests.packages.urllib3.exceptions.ProtocolError) and isinstance(exc.args[0].args[1], socket.error):
+            raise Error('{}: {}'.format(exc.args[0].args[1].args[1], url))
+        else:
+            raise Error(str(exc))
     data = r.json()
     url = urlparse.urljoin(app['logplex_url'], data['url'])
     while True:
@@ -415,16 +427,16 @@ def _cmd_log(app_name, num, tail):
             break
 
 
-def _cmd_upload(app_name):
-    tag = '{}:{}'.format(app_name, 'build')
+def _cmd_upload(app_name, image_tag):
+    app = _get_app(app_name)
 
-    cmd = ['docker', 'build', '-t', tag, '.']
+    cmd = ['docker', 'build', '-t', image_tag, '.']
     try:
         subprocess.check_call(cmd)
     except subprocess.CalledProcessError, exc:
         raise Error(str(exc))
 
-    cmd = ['docker', 'inspect', tag]
+    cmd = ['docker', 'inspect', image_tag]
     try:
         output = subprocess.check_output(cmd)
     except subprocess.CalledProcessError, exc:
@@ -434,35 +446,39 @@ def _cmd_upload(app_name):
     app_image_id = data[0]['Id'][:12]
     app_image_tar = '{}.tpxz'.format(app_image_id)
 
-    app = _get_app(app_name)
-    if app['app_image_id'] == app_image_id:
-        logging.debug('Docker image already uploaded: %s', app_image_id)
-        return
-
-    logging.debug('uploading: {} -> s3://{}/{}'.format(
-        app_image_id, app['image_bucket'], app_image_tar,
-    ))
-    p1 = subprocess.Popen(['docker', 'save', app_image_id],
-                          stdout=subprocess.PIPE)
-    p2 = subprocess.Popen(['pixz'], stdin=p1.stdout, stdout=subprocess.PIPE)
-    p1.stdout.close()
-    p3 = subprocess.Popen(['gof3r', 'put', '-b', app['image_bucket'],
-                           '-k', app_image_tar], stdin=p2.stdout)
-    p2.stdout.close()
-    p3.communicate()
-
-    logging.debug('updating Docker image ID: %s', app_image_id)
     resp, data = _call(
-        'dynamodb', 'UpdateItem',
-        table_name=_APP_TABLE,
-        key={'app_name': {'S': app_name}},
-        attribute_updates={
-            'app_image_id': {
-                'Value': {'S': app_image_id},
-                'Action': 'PUT',
-            },
-        },
+        's3', 'GetObject',
+        bucket=app['image_bucket'],
+        key=app_image_tar,
     )
+    if resp.status_code == 200:
+        logging.debug('Docker image already uploaded: %s', app_image_id)
+    else:
+        logging.debug('uploading: {} -> s3://{}/{}'.format(
+            app_image_id, app['image_bucket'], app_image_tar,
+        ))
+        p1 = subprocess.Popen(['docker', 'save', app_image_id],
+                              stdout=subprocess.PIPE)
+        p2 = subprocess.Popen(['pixz'], stdin=p1.stdout, stdout=subprocess.PIPE)
+        p1.stdout.close()
+        p3 = subprocess.Popen(['gof3r', 'put', '-b', app['image_bucket'],
+                               '-k', app_image_tar], stdin=p2.stdout)
+        p2.stdout.close()
+        p3.communicate()
+
+    for i, c in enumerate(app['task_definition']):
+        if c['image_tag'] != image_tag:
+            continue
+        logging.debug('updating Docker image ID: %s -> %s', c['name'],
+                      app_image_id)
+        update_expression = 'set task_definition[{}].image = :image'.format(i)
+        resp, data = _call(
+            'dynamodb', 'UpdateItem',
+            table_name=_APP_TABLE,
+            key={'app_name': {'S': app_name}},
+            update_expression=update_expression,
+            expression_attribute_values={':image': {'S': app_image_id}},
+        )
 
 
 def _cmd_cleanup(app_name):
@@ -510,14 +526,13 @@ def _cmd_cleanup(app_name):
 
 
 def _get_old_asg(app):
-    elbs = _get_elbs(app)
     asgs = []
     asg_old = None
-    if elbs:
-        logging.debug('verifying ELB: %s', elbs[0])
+    if app['elb_names']:
+        logging.debug('verifying ELB: %s', app['elb_names'][0])
 
         resp, data = _call('elb', 'DescribeLoadBalancers',
-                           load_balancer_names=elbs)
+                           load_balancer_names=app['elb_names'])
         elb = data['LoadBalancerDescriptions'][0]
 
         asgs = []
@@ -529,7 +544,8 @@ def _get_old_asg(app):
                             for i in data['AutoScalingInstances']))
 
         if len(asgs) > 1:
-            logging.critical('found %d ASGs for ELB %s', len(asgs), elbs[0])
+            logging.critical('found %d ASGs for ELB %s', len(asgs),
+                             app['elb_names'][0])
 
         if asgs:
             resp, data = _call('autoscaling', 'DescribeAutoScalingGroups',
@@ -565,10 +581,10 @@ def _get_security_groups(app):
 
 def _create_launch_config(app, timestamp, instance_profile, security_groups):
     lc_name = '{}-{}-{}'.format(app['env_name'], app['app_name'], timestamp)
-    logging.debug('creating LC: %s (%s)', lc_name, app['ami_image_id'])
+    logging.debug('creating LC: %s (%s)', lc_name, app['image_id'])
     kwargs = {
         'launch_configuration_name': lc_name,
-        'image_id': app['ami_image_id'],
+        'image_id': app['image_id'],
         'key_name': app['key_name'],
         'security_groups': security_groups,
         'instance_type': app['instance_type'],
@@ -602,7 +618,6 @@ def _get_role_arn(role_name):
 
 def _create_auto_scaling_group(app, timestamp, desired_capacity):
     asg_name = '{}-{}-{}'.format(app['env_name'], app['app_name'], timestamp)
-    elbs = _get_elbs(app)
     min_size = 0
     max_size = desired_capacity
     logging.debug('creating ASG: %s (%s/%s/%s)',
@@ -610,9 +625,9 @@ def _create_auto_scaling_group(app, timestamp, desired_capacity):
     kwargs = {
         'auto_scaling_group_name': asg_name,
         'launch_configuration_name': asg_name,
-        'load_balancer_names': elbs,
-        'health_check_type': app['health_check_type'],
-        'health_check_grace_period': app.get('health_check_grace_period', 300),
+        'load_balancer_names': app['elb_names'],
+        'health_check_type': 'ELB' if app['elb_names'] else 'EC2',
+        'health_check_grace_period': 300,
         'vpc_zone_identifier': ','.join(app['app_subnet_ids']),
         'availability_zones': app['availability_zones'],
         'min_size': min_size,
@@ -664,7 +679,6 @@ def _create_auto_scaling_group(app, timestamp, desired_capacity):
 
 def _wait_for_running_instances(app, timestamp, desired_capacity):
     asg_name = '{}-{}-{}'.format(app['env_name'], app['app_name'], timestamp)
-    elbs = _get_elbs(app)
     while True:
         healthy = []
         resp, data = _call(
@@ -673,10 +687,10 @@ def _wait_for_running_instances(app, timestamp, desired_capacity):
         )
         asg = data['AutoScalingGroups'][0]
 
-        if elbs:
+        if app['elb_names']:
             resp, data = _call(
                 'elb', 'DescribeInstanceHealth',
-                load_balancer_name=elbs[0],
+                load_balancer_name=app['elb_names'][0],
                 instances=[{'InstanceId': i['InstanceId']}
                            for i in asg['Instances']],
             )
@@ -832,27 +846,24 @@ def _get_app(app_name):
         ),
         'builder_instance_type': env_data['builder_instance_type']['S'],
         'builder_subnet_id': env_data['builder_subnet_id']['S'],
-        'config_vars': simplejson.loads(app_data['config_vars']['S']),
         'env_name': env_data['env_name']['S'],
-        'health_check_type': app_data['health_check_type']['S'],
         'image_bucket': env_data['image_bucket']['S'],
         'instance_type': app_data['instance_type']['S'],
         'key_name': env_data['key_name']['S'],
         'preferred_availability_zone': env_data[
             'preferred_availability_zone']['S'],
-        'process_types': simplejson.loads(app_data['process_types']['S']),
         'vpc_id': env_data['vpc_id']['S'],
     }
 
-    if 'ami_image_id' in app_data:
-        app['ami_image_id'] = app_data['ami_image_id']['S']
+    if 'elb_names' in app_data:
+        app['elb_names'] = _ddb_parse(app_data['elb_names'])
     else:
-        app['ami_image_id'] = ''
+        app['elb_names'] = []
 
-    if 'app_image_id' in app_data:
-        app['app_image_id'] = app_data['app_image_id']['S']
+    if 'image_id' in app_data:
+        app['image_id'] = app_data['image_id']['S']
     else:
-        app['app_image_id'] = ''
+        app['image_id'] = ''
 
     if 'instance_profile_name' in app_data:
         app['instance_profile_name'] = app_data['instance_profile_name']['S']
@@ -860,16 +871,12 @@ def _get_app(app_name):
         app['instance_profile_name'] = ''
 
     if 'lifecycle_hooks' in app_data:
-        app['lifecycle_hooks'] = simplejson.loads(
-            app_data['lifecycle_hooks']['S'],
-        )
+        app['lifecycle_hooks'] = _ddb_parse(app_data['lifecycle_hooks'])
     else:
         app['lifecycle_hooks'] = []
 
     if 'scaling_policies' in app_data:
-        app['scaling_policies'] = simplejson.loads(
-            app_data['scaling_policies']['S'],
-        )
+        app['scaling_policies'] = _ddb_parse(app_data['scaling_policies'])
     else:
         app['scaling_policies'] = []
 
@@ -908,14 +915,38 @@ def _get_app(app_name):
     else:
         app['user_data'] = ''
 
+    if 'task_definition' in app_data:
+        app['task_definition'] = _ddb_parse(app_data['task_definition'])
+    else:
+        app['task_definition'] = []
+
+    if 'extra_images' in app_data:
+        app['extra_images'] = _ddb_parse(app_data['extra_images'])
+    else:
+        app['extra_images'] = []
+
     return app
 
 
-def _get_elbs(app):
-    elbs = []
-    if app['health_check_type'] == 'ELB':
-        elbs.append('{}-{}'.format(app['env_name'], app['app_name']))
-    return elbs
+def _ddb_parse(elem):
+    # logging.debug('elem=%s', elem)
+    assert isinstance(elem, dict)
+    assert len(elem.items()) == 1
+
+    key = elem.keys()[0]
+    value = elem.values()[0]
+
+    if key == 'M':
+        return dict((k, _ddb_parse(v)) for k, v in value.items())
+    elif key == 'L':
+        return [_ddb_parse(v) for v in value]
+    elif key == 'S':
+        return value
+    elif key == 'N':
+        return int(value)
+    elif key == 'BOOL':
+        return bool(value)
+    return None
 
 
 if __name__ == '__main__':

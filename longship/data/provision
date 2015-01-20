@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# fail fast
+set -o errexit
+set -o nounset
+set -o pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+codename=$(lsb_release -cs)
+
+# startup
+while ! test -f /var/lib/cloud/instance/boot-finished
+do
+  echo 'waiting for system to finish starting up'
+  sleep 2
+done
+
+# packages
+echo "deb http://us-east-1.ec2.archive.ubuntu.com/ubuntu $codename-backports main restricted universe multiverse" > /etc/apt/sources.list.d/ubuntu-backports.list
+echo "deb https://get.docker.io/ubuntu docker main" > /etc/apt/sources.list.d/docker.list
+apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys A88D21E9
+apt-get -qqy clean
+apt-get -qqy autoclean
+apt-get -qqy update
+#apt-get -qy remove --purge apport apport-symptoms command-not-found command-not-found-data fuse landscape-client landscape-common mlocate popularity-contest ppp pppconfig pppoeconf python-twisted-names python-twisted-web python3-apport python3-problem-report
+#apt-get -qy upgrade
+apt-get -qy install --no-install-recommends btrfs-tools chrony haveged linux-image-virtual-lts-utopic lxc-docker pixz
+usermod -G docker ubuntu
+
+# tools
+curl -fsSL -o /usr/local/bin/gof3r.xz https://s3.amazonaws.com/cb-misc/linux-amd64/bin/gof3r.xz
+xz -d /usr/local/bin/gof3r.xz
+chmod 755 /usr/local/bin/gof3r
+curl -fsSL -o /usr/local/bin/log-shuttle.xz https://s3.amazonaws.com/cb-misc/linux-amd64/bin/log-shuttle.xz
+xz -d /usr/local/bin/log-shuttle.xz
+chmod 755 /usr/local/bin/log-shuttle
+
+# services
+chmod 755 /tmp/create-task
+/tmp/create-task < /tmp/task-definition.json
+
+# cleanup
+sed -i -e '/mnt/d' /etc/fstab
