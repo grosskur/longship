@@ -3,17 +3,7 @@
 Cloud-native application management tool for AWS.
 
 ```bash
-$ longship init prod
-$ longship create --env prod myapp
-$ longship upload
-$ longship build
-$ longship deploy
-$ longship cleanup
-$ longship set FOO=bar
-$ longship unset FOO
-$ longship scale web=2 worker=1
-$ longship web=t2.medium worker=m3.large
-$ longship tail -f
+$ longship push
 ```
 
 ## Overview
@@ -24,6 +14,8 @@ groups to present a simple "application" abstraction.
 
 Longship is a lean tool. It aims to provide the usability of PaaS
 without the operational burden of running a PaaS.
+
+Longship stores data in DynamoDB.
 
 ## How it works
 
@@ -44,26 +36,14 @@ usage: longship [--version] [--help] <command> [<args>]
 Cloud-native application management tool for AWS
 
 Available commands:
-    init           initialize region for running apps
-    topology       show network topology in region
-    apps           show list of apps
-    create         create a new app
+    list           show list of apps
     info           show details about an app
-    tail           view logs for an app
-    env            show environment variables for an app
-    set            set environment variables for an app
-    unset          unset environment variables for an app
-    build          build an AMI from an app image
+    upload         build and upload an Docker image
+    build          build an AMI from Docker images
     deploy         deploy an AMI into an auto-scaling group
-    releases       show list of releases for an app
-    rollback       rollback to a prior AMI
+    push           runs upload, build, and deploy in sequence
+    log            tail logs for an app
     cleanup        remove old unused auto-scaling groups
-    ps             list process types for an app
-    scale          change the instance count for a process type
-    resize         change the instance type for a process type
-    policy         show IAM policy for an app
-    destroy        destroy an app
-    nuke           destroy all apps and metadata in a region
 
 Globally recognized options:
     -v, --verbose  verbose output
@@ -71,14 +51,23 @@ Globally recognized options:
 
 ## Acknowledgements
 
-* The Twelve-Factor App
-* Asgard (blog post)
-* Aminator (blog post)
-* Packer
-* amzn-ship (Application Platforms on AWS)
-* ionblaster (DockerCon talk)
+* [The Twelve-Factor App][12factor]
+* [Phoenix server][fowler-phoenix-server]
+* [Immutable server][fowler-immutable-server]
+* [Asgard][asgard-github] ([blog post][asgard-blog-post])
+* [Aminator][aminator-github] ([blog post][aminator-blog-post])
+* [Packer][packer-github]
+* [amzn-ship][amzn-ship-github] ([Application Platforms on AWS][r32k-app-platforms])
+* ionblaster ([DockerCon talk][gilt-dockercon-talk])
 
-http://techblog.netflix.com/2012/06/asgard-web-based-cloud-management-and.html
-http://techblog.netflix.com/2013/03/ami-creation-with-aminator.html
-http://martinfowler.com/bliki/PhoenixServer.html
-http://martinfowler.com/bliki/ImmutableServer.html
+[12factor]: http://12factor.net/
+[aminator-blog-post]: http://techblog.netflix.com/2013/03/ami-creation-with-aminator.html
+[aminator-github]: https://github.com/Netflix/aminator
+[amzn-ship-github]: https://github.com/ryandotsmith/amzn-ship
+[asgard-blog-post]: http://techblog.netflix.com/2012/06/asgard-web-based-cloud-management-and.html
+[asgard-github]: https://github.com/Netflix/asgard
+[fowler-phoenix-server]: http://martinfowler.com/bliki/PhoenixServer.html
+[fowler-immutable-server]: http://martinfowler.com/bliki/ImmutableServer.html
+[gilt-dockercon-talk]: https://www.youtube.com/watch?v=GaHzdqFithc
+[packer-github]: https://github.com/mitchellh/packer
+[r32k-app-platforms]: http://r.32k.io/app-platforms-on-aws
